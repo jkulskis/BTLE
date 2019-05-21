@@ -1,4 +1,4 @@
-// BLE sniffer by Xianjun Jiao (putaoshu@msn.com)
+// BTLE signal scanner by Xianjun Jiao (putaoshu@gmail.com)
 
 /*
  * Copyright 2012 Jared Boone <jared@sharebrained.com>
@@ -21,7 +21,7 @@
  * the Free Software Foundation, Inc., 51 Franklin Street,
  * Boston, MA 02110-1301, USA.
  */
-#include <pthread.h>
+
 #include "common.h"
 
 #ifdef USE_BLADERF
@@ -42,8 +42,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
-
-#include <netinet/in.h>
 
 //----------------------------------some sys stuff----------------------------------
 #ifndef bool
@@ -123,53 +121,6 @@ void sigint_callback_handler(int signum)
 }
 #endif
 
-/* File handling for pcap + BTLE, don't use btbb as it's too buggy and slow */
-// TCPDUMP_MAGIC PCAP_VERSION_MAJOR PCAP_VERSION_MINOR thiszone sigfigs snaplen linktype (DLT_BLUETOOTH_LE_LL_WITH_PHDR)
-// 0xa1b2c3d4 \x00\x02 \x00\x04 \x00\x00\x00\x00 \x00\x00\x00\x00 \x00\x00\x05\xDC \x00\x00\x01\x00
-const char* PCAP_HDR_TCPDUMP = "\xA1\xB2\xC3\xD4\x00\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\xDC\x00\x00\x01\x00";
-const int PCAP_HDR_TCPDUMP_LEN = 24;
-//const char* PCAP_FILE_NAME = "btle_store.pcap";
-char* filename_pcap = NULL;
-FILE *fh_pcap_store;
-
-void init_pcap_file() {
-    fh_pcap_store = fopen(filename_pcap, "wb");
-    fwrite(PCAP_HDR_TCPDUMP, 1, PCAP_HDR_TCPDUMP_LEN, fh_pcap_store);
-}
-
-typedef struct {
-    int sec;
-    int usec;
-    int caplen;
-    int len;
-} pcap_header;
-
-const uint8_t BTLE_HEADER_LEN = 10;
-
-// http://www.whiterocker.com/bt/LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR.html
-// num_demod_byte -- LE packet: header + data
-void write_packet_to_file(FILE *fh, int packet_len, uint8_t *packet, uint8_t channel, uint32_t access_addr){
-   // flags: 0x0001 indicates the LE Packet is de-whitened
-   // pcap header: tv_sec tv_usec caplen len
-   pcap_header header_pcap;
-   //header_pcap.sec = packetcount++;
-   header_pcap.caplen = htonl(BTLE_HEADER_LEN + 4 + packet_len);
-   header_pcap.len = htonl(BTLE_HEADER_LEN + 4 + packet_len);
-   fwrite(&header_pcap, 16, 1, fh_pcap_store);
-   // BTLE header: RF_Channel:1 Signal_Power:1 Noise_Power:1 Access_address_off:1 Reference_access_address (receiver):4 flags:2 packet
-   uint8_t header_btle[10] = {channel, 0, 0, 0, 0, 0, 0, 0, 1, 0};
-   fwrite(header_btle, 1, 10, fh);
-   fwrite(&access_addr, 1, 4, fh);
-   fwrite(packet, 1, packet_len, fh);
-}
-void write_dummy_entry(){
-    uint8_t pkt[10] = {7,7,7,7,7,7,7,7,7,7};
-    write_packet_to_file(fh_pcap_store, 10, pkt, 1, 0xFFFFFFF1);
-    write_packet_to_file(fh_pcap_store, 10, pkt, 2, 0xFFFFFFF2);
-    write_packet_to_file(fh_pcap_store, 10, pkt, 3, 0xFFFFFFF3);
-}
-
-
 //----------------------------------some sys stuff----------------------------------
 
 //----------------------------------some basic signal definition----------------------------------
@@ -201,283 +152,174 @@ volatile int rx_buf_offset; // remember to initialize it!
 
 static void print_usage(void);
 
-typedef int8_t IQ_TYPE;
-volatile IQ_TYPE rx_buf[LEN_BUF + LEN_BUF_MAX_NUM_PHY_SAMPLE];
-
 //----------------------------------board specific operation----------------------------------
 
 #ifdef USE_BLADERF //--------------------------------------BladeRF-----------------------
 char *board_name = "BladeRF";
-#define MAX_GAIN 60
-#define DEFAULT_GAIN 45
+#define MAX_GAIN 66
+#define DEFAULT_GAIN 66
 typedef struct bladerf_devinfo bladerf_devinfo;
 typedef struct bladerf bladerf_device;
-//typedef int16_t IQ_TYPE;
-//volatile IQ_TYPE rx_buf[LEN_BUF+LEN_BUF_MAX_NUM_PHY_SAMPLE];
-
-struct bladerf_async_task
+typedef int16_t IQ_TYPE;
+volatile IQ_TYPE rx_buf[LEN_BUF+LEN_BUF_MAX_NUM_PHY_SAMPLE];
+static inline const char *backend2str(bladerf_backend b)
 {
-    pthread_t rx_task;
-    pthread_mutex_t stderr_lock;
-};
-
-struct bladerf_data
-{
-    void                **buffers;      /* Transmit buffers */
-    size_t              num_buffers;    /* Number of buffers */
-    size_t              samples_per_buffer; /* Number of samples per buffer */
-    unsigned int        idx;            /* The next one that needs to go out */
-    volatile IQ_TYPE    *rx_buf;        /* rx buffer */
-//    bladerf_module      module;         /* Direction */
-//    FILE                *fout;          /* Output file (RX only) */
-//    ssize_t             samples_left;   /* Number of samples left */
-};
-
-struct bladerf_stream *stream;
-struct bladerf_async_task async_task;
-struct bladerf_data rx_data;
-//unsigned int count = 0;
-
-void *stream_callback(struct bladerf *dev, struct bladerf_stream *stream,
-                      struct bladerf_metadata *metadata, void *samples,
-                      size_t num_samples, void *user_data)
-{
-    struct bladerf_data *my_data = (struct bladerf_data *)user_data;
-
-    //count++ ;
-
-    //if( (count&0xffff) == 0 ) {
-    //    fprintf( stderr, "Called 0x%8.8x times\n", count ) ;
-    //}
-
-    /* Save off the samples to disk if we are in RX */
-    //if( my_data->module == BLADERF_MODULE_RX ) {
-        size_t i;
-        int16_t *sample = (int16_t *)samples ;
-        for(i = 0; i < num_samples ; i++ ) {
-            //*(sample) &= 0xfff ;
-            //if( (*sample)&0x800 ) *(sample) |= 0xf000 ;
-            //*(sample+1) &= 0xfff ;
-            //if( *(sample+1)&0x800 ) *(sample+1) |= 0xf000 ;
-            //fprintf( my_data->fout, "%d, %d\n", *sample, *(sample+1) );
-
-            rx_buf[rx_buf_offset] = (((*sample)>>4)&0xFF);
-            rx_buf[rx_buf_offset+1] = (((*(sample+1))>>4)&0xFF);
-            rx_buf_offset = (rx_buf_offset+2)&( LEN_BUF-1 ); //cyclic buffer
-
-            sample += 2 ;
-        }
-        //my_data->samples_left -= num_samples ;
-        //if( my_data->samples_left <= 0 ) {
-        //    do_exit = true ;
-        //}
-    //}
-
-    if (do_exit) {
-        return NULL;
-    } else {
-        void *rv = my_data->buffers[my_data->idx];
-        my_data->idx = (my_data->idx + 1) % my_data->num_buffers;
-        return rv ;
+    switch (b) {
+        case BLADERF_BACKEND_LIBUSB:
+            return "libusb";
+        case BLADERF_BACKEND_LINUX:
+            return "Linux kernel driver";
+        default:
+            return "Unknown";
     }
 }
 
-int board_set_freq(struct bladerf *dev, uint64_t freq_hz) {
-  int status;
-  status = bladerf_set_frequency(dev, BLADERF_MODULE_RX, freq_hz);
+int init_board(bladerf_device *dev, bladerf_devinfo *dev_info) {
+  int n_devices = bladerf_get_device_list(&dev_info);
+
+  if (n_devices < 0) {
+    if (n_devices == BLADERF_ERR_NODEV) {
+        printf("init_board: No bladeRF devices found.\n");
+    } else {
+        printf("init_board: Failed to probe for bladeRF devices: %s\n", bladerf_strerror(n_devices));
+    }
+		print_usage();
+		return(-1);
+  }
+
+  printf("init_board: %d bladeRF devices found! The 1st one will be used:\n", n_devices);
+  printf("    Backend:        %s\n", backend2str(dev_info[0].backend));
+  printf("    Serial:         %s\n", dev_info[0].serial);
+  printf("    USB Bus:        %d\n", dev_info[0].usb_bus);
+  printf("    USB Address:    %d\n", dev_info[0].usb_addr);
+
+  int fpga_loaded;
+  int status = bladerf_open(&dev, NULL);
   if (status != 0) {
-      fprintf(stderr, "Failed to set frequency: %s\n",
+    printf("init_board: Failed to open bladeRF device: %s\n",
+            bladerf_strerror(status));
+    return(-1);
+  }
+
+  fpga_loaded = bladerf_is_fpga_configured(dev);
+  if (fpga_loaded < 0) {
+      printf("init_board: Failed to check FPGA state: %s\n",
+                bladerf_strerror(fpga_loaded));
+      status = -1;
+      goto initialize_device_out_point;
+  } else if (fpga_loaded == 0) {
+      printf("init_board: The device's FPGA is not loaded.\n");
+      status = -1;
+      goto initialize_device_out_point;
+  }
+
+  unsigned int actual_sample_rate;
+  status = bladerf_set_sample_rate(dev, BLADERF_MODULE_RX, SAMPLE_PER_SYMBOL*1000000ul, &actual_sample_rate);
+  if (status != 0) {
+      printf("init_board: Failed to set samplerate: %s\n",
               bladerf_strerror(status));
+      goto initialize_device_out_point;
+  }
+
+  status = bladerf_set_frequency(dev, BLADERF_MODULE_RX, 2402000000ul);
+  if (status != 0) {
+      printf("init_board: Failed to set frequency: %s\n",
+              bladerf_strerror(status));
+      goto initialize_device_out_point;
+  }
+
+  unsigned int actual_frequency;
+  status = bladerf_get_frequency(dev, BLADERF_MODULE_RX, &actual_frequency);
+  if (status != 0) {
+      printf("init_board: Failed to read back frequency: %s\n",
+              bladerf_strerror(status));
+      goto initialize_device_out_point;
+  }
+
+initialize_device_out_point:
+  if (status != 0) {
       bladerf_close(dev);
-      return EXIT_FAILURE;
+      dev = NULL;
+      return(-1);
   }
-  return(0);
-}
-
-/* Thread-safe wrapper around fprintf(stderr, ...) */
-#define print_error(repeater_, ...) do { \
-    pthread_mutex_lock(&repeater_->stderr_lock); \
-    fprintf(stderr, __VA_ARGS__); \
-    pthread_mutex_unlock(&repeater_->stderr_lock); \
-} while (0)
-
-void *rx_task_run(void *tmp)
-{
-  int status;
-  struct bladerf_async_task *tmp_p = &async_task;
-
-  /* Start stream and stay there until we kill the stream */
-  status = bladerf_stream(stream, BLADERF_MODULE_RX);
-  if (status < 0) {
-    print_error(tmp_p, "RX stream failure: %s\r\n", bladerf_strerror(status));
-  }
-  return NULL;
-}
-
-inline int config_run_board(uint64_t freq_hz, int gain, void **rf_dev) {
-  int status;
-  unsigned int actual;
-  struct bladerf *dev;
-
-  rx_data.idx = 0;
-  rx_data.num_buffers = 2;
-  rx_data.samples_per_buffer = (LEN_BUF/2);
-  rx_data.rx_buf = rx_buf;
 
   #ifdef _MSC_VER
     SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sighandler, TRUE );
   #else
-  if (signal(SIGINT, sigint_callback_handler) == SIG_ERR ||
-      signal(SIGTERM, sigint_callback_handler) == SIG_ERR) {
-      fprintf(stderr, "Failed to set up signal handler\n");
-      return EXIT_FAILURE;
-  }
+    signal(SIGINT, &sigint_callback_handler);
+    signal(SIGILL, &sigint_callback_handler);
+    signal(SIGFPE, &sigint_callback_handler);
+    signal(SIGSEGV, &sigint_callback_handler);
+    signal(SIGTERM, &sigint_callback_handler);
+    signal(SIGABRT, &sigint_callback_handler);
   #endif
 
-  status = bladerf_open(&dev, NULL);
-  if (status < 0) {
-      fprintf(stderr, "Failed to open device: %s\n", bladerf_strerror(status));
-      return EXIT_FAILURE;
-  } else  {
-    fprintf(stdout, "open device: %s\n", bladerf_strerror(status));
-  }
-  
-  status = bladerf_is_fpga_configured(dev);
-  if (status < 0) {
-      fprintf(stderr, "Failed to determine FPGA state: %s\n",
-              bladerf_strerror(status));
-      return EXIT_FAILURE;
-  } else if (status == 0) {
-      fprintf(stderr, "Error: FPGA is not loaded.\n");
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else  {
-    fprintf(stdout, "FPGA is loaded.\n");
-  }
-  
-  status = bladerf_set_frequency(dev, BLADERF_MODULE_RX, freq_hz);
-  if (status != 0) {
-      fprintf(stderr, "Failed to set frequency: %s\n",
-              bladerf_strerror(status));
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else {
-      fprintf(stdout, "set frequency: %luHz %s\n", freq_hz,
-              bladerf_strerror(status));
-  }
-
-  status = bladerf_set_sample_rate(dev, BLADERF_MODULE_RX, SAMPLE_PER_SYMBOL*1000000ul, &actual);
-  if (status != 0) {
-      fprintf(stderr, "Failed to set sample rate: %s\n",
-              bladerf_strerror(status));
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else {
-    fprintf(stdout, "set sample rate: %dHz %s\n", actual,
-              bladerf_strerror(status));
-  }
-  
-  status = bladerf_set_bandwidth(dev, BLADERF_MODULE_RX, SAMPLE_PER_SYMBOL*1000000ul/2, &actual);
-  if (status != 0) {
-      fprintf(stderr, "Failed to set bandwidth: %s\n",
-              bladerf_strerror(status));
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else {
-    fprintf(stdout, "bladerf_set_bandwidth: %d %s\n", actual,
-              bladerf_strerror(status));
-  }
-  
-  status = bladerf_set_gain(dev, BLADERF_MODULE_RX, gain);
-  if (status != 0) {
-      fprintf(stderr, "Failed to set gain: %s\n",
-              bladerf_strerror(status));
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else {
-    fprintf(stdout, "bladerf_set_gain: %d %s\n", gain,
-              bladerf_strerror(status));
-  }
-
-#if 0 // old version do not have this API
-  status = bladerf_get_gain(dev, BLADERF_MODULE_RX, &actual);
-  if (status != 0) {
-      fprintf(stderr, "Failed to get gain: %s\n",
-              bladerf_strerror(status));
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else {
-    fprintf(stdout, "bladerf_get_gain: %d %s\n", actual,
-              bladerf_strerror(status));
-  }
-#endif
-
-  /* Initialize the stream */
-  status = bladerf_init_stream(
-              &stream,
-              dev,
-              stream_callback,
-              &rx_data.buffers,
-              rx_data.num_buffers,
-              BLADERF_FORMAT_SC16_Q11,
-              rx_data.samples_per_buffer,
-              rx_data.num_buffers,
-              &rx_data
-            );
-
-  if (status != 0) {
-      fprintf(stderr, "Failed to init stream: %s\n",
-              bladerf_strerror(status));
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else {
-    fprintf(stdout, "init stream: %s\n",
-              bladerf_strerror(status));
-  }
-
-  bladerf_set_stream_timeout(dev, BLADERF_MODULE_RX, 100);
-
-  status = bladerf_enable_module(dev, BLADERF_MODULE_RX, true);
-  if (status < 0) {
-      fprintf(stderr, "Failed to enable module: %s\n",
-              bladerf_strerror(status));
-      bladerf_deinit_stream(stream);
-      bladerf_close(dev);
-      return EXIT_FAILURE;
-  } else {
-    fprintf(stdout, "enable module true: %s\n",
-              bladerf_strerror(status));
-  }
-
-  status = pthread_create(&(async_task.rx_task), NULL, rx_task_run, NULL);
-  if (status < 0) {
-      return EXIT_FAILURE;
-  }
-
-  (*rf_dev) = dev;
+  printf("init_board: set bladeRF to %f MHz %u sps BLADERF_LB_NONE.\n", (float)actual_frequency/1000000.0f, actual_sample_rate);
   return(0);
 }
 
-void stop_close_board(struct bladerf *dev){
+int board_set_freq(void *device, uint64_t freq_hz) {
+  return(-1); //dummy
+}
+
+inline int open_board(uint64_t freq_hz, int gain, bladerf_device *dev) {
   int status;
 
-  bladerf_deinit_stream(stream);
-  printf("bladerf_deinit_stream.\n");
-
-  status = bladerf_enable_module(dev, BLADERF_MODULE_RX, false);
-  if (status < 0) {
-      fprintf(stderr, "Failed to enable module: %s\n",
-              bladerf_strerror(status));
-  } else {
-    fprintf(stdout, "enable module false: %s\n", bladerf_strerror(status));
+  status = bladerf_set_frequency(dev, BLADERF_MODULE_RX, freq_hz);
+  if (status != 0) {
+    printf("open_board: Failed to set frequency: %s\n",
+            bladerf_strerror(status));
+    return(-1);
   }
 
-  bladerf_close(dev);
-  printf("bladerf_close.\n");
+  status = bladerf_set_gain(dev, BLADERF_MODULE_RX, gain);
+  if (status != 0) {
+    printf("open_board: Failed to set gain: %s\n",
+            bladerf_strerror(status));
+    return(-1);
+  }
 
-  pthread_join(async_task.rx_task, NULL);
-  //pthread_cancel(async_task.rx_task);
-  printf("bladeRF rx thread quit.\n");
+  status = bladerf_sync_config(dev, BLADERF_MODULE_RX, BLADERF_FORMAT_SC16_Q11, 2, LEN_BUF_IN_SAMPLE, 1, 3500);
+  if (status != 0) {
+     printf("open_board: Failed to configure sync interface: %s\n",
+             bladerf_strerror(status));
+     return(-1);
+  }
+
+  status = bladerf_enable_module(dev, BLADERF_MODULE_RX, true);
+  if (status != 0) {
+     printf("open_board: Failed to enable module: %s\n",
+             bladerf_strerror(status));
+     return(-1);
+  }
+
+  return(0);
+}
+
+inline int close_board(bladerf_device *dev) {
+  // Disable TX module, shutting down our underlying TX stream
+  int status = bladerf_enable_module(dev, BLADERF_MODULE_RX, false);
+  if (status != 0) {
+    printf("close_board: Failed to disable module: %s\n",
+             bladerf_strerror(status));
+    return(-1);
+  }
+
+  return(0);
+}
+
+void exit_board(bladerf_device *dev) {
+  bladerf_close(dev);
+  dev = NULL;
+}
+
+bladerf_device* config_run_board(uint64_t freq_hz, int gain, void **rf_dev) {
+  bladerf_device *dev = NULL;
+  return(dev);
+}
+
+void stop_close_board(bladerf_device* rf_dev){
+  
 }
 
 #else //-----------------------------the board is HACKRF-----------------------------
@@ -485,6 +327,9 @@ char *board_name = "HACKRF";
 #define MAX_GAIN 62
 #define DEFAULT_GAIN 6
 #define MAX_LNA_GAIN 40
+
+typedef int8_t IQ_TYPE;
+volatile IQ_TYPE rx_buf[LEN_BUF + LEN_BUF_MAX_NUM_PHY_SAMPLE];
 
 int rx_callback(hackrf_transfer* transfer) {
   int i;
@@ -1180,10 +1025,9 @@ void parse_commandline(
   int* raw_flag,
   uint64_t* freq_hz, 
   uint32_t* access_mask, 
-  int* hop_flag,
-  char** filename_pcap
+  int* hop_flag
 ) {
-  printf("BLE sniffer. Xianjun Jiao. putaoshu@msn.com\n\n");
+  printf("BTLE/BT4.0 Scanner(NO bladeRF support so far). Xianjun Jiao. putaoshu@gmail.com\n\n");
   
   // Default values
   (*chan) = DEFAULT_CHANNEL;
@@ -1203,8 +1047,6 @@ void parse_commandline(
   (*access_mask) = 0xFFFFFFFF;
   
   (*hop_flag) = 0;
-  
-  (*filename_pcap) = 0;
 
   while (1) {
     static struct option long_options[] = {
@@ -1218,12 +1060,11 @@ void parse_commandline(
       {"freq_hz",           required_argument, 0, 'f'},
       {"access_mask",         required_argument, 0, 'm'},
       {"hop",         no_argument, 0, 'o'},
-      {"filename",         required_argument, 0, 's'},
       {0, 0, 0, 0}
     };
     /* getopt_long stores the option index here. */
     int option_index = 0;
-    int c = getopt_long (argc, argv, "hc:g:a:k:vrf:m:os:",
+    int c = getopt_long (argc, argv, "hc:g:a:k:vrf:m:o",
                      long_options, &option_index);
 
     /* Detect the end of the options. */
@@ -1277,10 +1118,6 @@ void parse_commandline(
         
       case 'k':
         (*crc_init) = strtol(optarg,&endp,16);
-        break;
-
-      case 's':
-        (*filename_pcap) = (char*)optarg;
         break;
         
       case '?':
@@ -2016,7 +1853,6 @@ void print_adv_pdu_payload(void *adv_pdu_payload, ADV_PDU_TYPE pdu_type, int pay
     printf(" CRC%d\n", crc_flag);
 }
 
-// demodulates and parses a packet
 void receiver(IQ_TYPE *rxp_in, int buf_len, int channel_number, uint32_t access_addr, uint32_t crc_init, int verbose_flag, int raw_flag) {
   static int pkt_count = 0;
   static ADV_PDU_PAYLOAD_TYPE_R adv_pdu_payload;
@@ -2069,7 +1905,6 @@ void receiver(IQ_TYPE *rxp_in, int buf_len, int channel_number, uint32_t access_
     }
 
     demod_byte(rxp, num_demod_byte, tmp_byte);
-
     if(!raw_flag) scramble_byte(tmp_byte, num_demod_byte, scramble_table[channel_number], tmp_byte);
     rxp = rxp_in + buf_len_eaten;
     num_symbol_left = (buf_len-buf_len_eaten)/(SAMPLE_PER_SYMBOL*2);
@@ -2106,7 +1941,6 @@ void receiver(IQ_TYPE *rxp_in, int buf_len, int channel_number, uint32_t access_
       parse_ll_pdu_header_byte(tmp_byte, &ll_pdu_type, &ll_nesn, &ll_sn, &ll_md, &payload_len);
     }
     
-
     //num_pdu_payload_crc_bits = (payload_len+3)*8;
     num_demod_byte = (payload_len+3);
     buf_len_eaten = buf_len_eaten + 8*num_demod_byte*2*SAMPLE_PER_SYMBOL;
@@ -2129,10 +1963,7 @@ void receiver(IQ_TYPE *rxp_in, int buf_len, int channel_number, uint32_t access_
     gettimeofday(&time_current_pkt, NULL);
     time_diff = TimevalDiff(&time_current_pkt, &time_pre_pkt);
     time_pre_pkt = time_current_pkt;
-
-    if(filename_pcap != NULL)
-        write_packet_to_file(fh_pcap_store, payload_len+2, tmp_byte, channel_number, access_addr);
-
+    
     printf("%ld.%06ld Pkt%d Ch%d AA:%08x ", time_current_pkt.tv_sec, time_current_pkt.tv_usec, pkt_count, channel_number, access_addr);
     
     if (adv_flag) {
@@ -2162,7 +1993,6 @@ bool chm_is_full_map(uint8_t *chm) {
   return(false);
 }
 
-// state machine
 int receiver_controller(void *rf_dev, int verbose_flag, int *chan, uint32_t *access_addr, uint32_t *crc_init_internal) {
   const int guard_us = 7000;
   const int guard_us1 = 4000;
@@ -2292,19 +2122,14 @@ int main(int argc, char** argv) {
   void* rf_dev;
   IQ_TYPE *rxp;
 
-  parse_commandline(argc, argv, &chan, &gain, &access_addr, &crc_init, &verbose_flag, &raw_flag, &freq_hz, &access_addr_mask, &hop_flag, &filename_pcap);
-
+  parse_commandline(argc, argv, &chan, &gain, &access_addr, &crc_init, &verbose_flag, &raw_flag, &freq_hz, &access_addr_mask, &hop_flag);
+  
   if (freq_hz == 123)
     freq_hz = get_freq_by_channel_number(chan);
   
   uint32_to_bit_array(access_addr_mask, access_bit_mask);
   
-  printf("Cmd line input: chan %d, freq %ldMHz, access addr %08x, crc init %06x raw %d verbose %d rx %ddB (%s) file=%s\n", chan, freq_hz/1000000, access_addr, crc_init, raw_flag, verbose_flag, gain, board_name, filename_pcap);
-
-  if(filename_pcap != NULL) {
-    printf("will store packets to: %s\n", filename_pcap);
-    init_pcap_file();
-  }
+  printf("Cmd line input: chan %d, freq %ldMHz, access addr %08x, crc init %06x raw %d verbose %d rx %ddB (%s)\n", chan, freq_hz/1000000, access_addr, crc_init, raw_flag, verbose_flag, gain, board_name);
   
   // run cyclic recv in background
   do_exit = false;
@@ -2392,9 +2217,7 @@ int main(int argc, char** argv) {
   }
 
 program_quit:
-  printf("Exit main loop ...\n");
   stop_close_board(rf_dev);
-
-  if(fh_pcap_store) fclose(fh_pcap_store);
+  
   return(0);
 }

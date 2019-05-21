@@ -2129,11 +2129,15 @@ void receiver(IQ_TYPE *rxp_in, int buf_len, int channel_number, uint32_t access_
     gettimeofday(&time_current_pkt, NULL);
     time_diff = TimevalDiff(&time_current_pkt, &time_pre_pkt);
     time_pre_pkt = time_current_pkt;
-
+    
+<<<<<<< HEAD
+    printf("%07dus Pkt%03d Ch%d AA:%08x ", time_diff, pkt_count, channel_number, access_addr);
     if(filename_pcap != NULL)
         write_packet_to_file(fh_pcap_store, payload_len+2, tmp_byte, channel_number, access_addr);
 
+=======
     printf("%ld.%06ld Pkt%d Ch%d AA:%08x ", time_current_pkt.tv_sec, time_current_pkt.tv_usec, pkt_count, channel_number, access_addr);
+>>>>>>> de133ac461eaf1be833ec2e5a820705f2495694c
     
     if (adv_flag) {
       printf("ADV_PDU_t%d:%s T%d R%d PloadL%d ", adv_pdu_type, ADV_PDU_TYPE_STR[adv_pdu_type], adv_tx_add, adv_rx_add, payload_len);
