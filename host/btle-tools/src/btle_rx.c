@@ -2081,13 +2081,12 @@ void receiver(IQ_TYPE *rxp_in, int buf_len, int channel_number, uint32_t access_
       time_diff = TimevalDiff(&time_current_pkt, &time_pre_pkt);
       time_pre_pkt = time_current_pkt;
     
-      printf("%dus Pkt%d Ch%d AA:%08x ", time_diff, pkt_count, channel_number, access_addr);
-      printf("Raw:");
+      printf("%ld.%06ld Pkt%d Ch%d AA:%08x ", time_current_pkt.tv_sec, time_current_pkt.tv_usec, pkt_count, channel_number, access_addr);      printf("Raw:");
       for(i=0; i<42; i++) {
         printf("%02x", tmp_byte[i]);
       }
       printf("\n");
-      
+      fflush(stdout);
       continue;
     }
     
@@ -2100,10 +2099,12 @@ void receiver(IQ_TYPE *rxp_in, int buf_len, int channel_number, uint32_t access_
           printf("ADV_PDU_t%d:%s T%d R%d PloadL%d ", adv_pdu_type, ADV_PDU_TYPE_STR[adv_pdu_type], adv_tx_add, adv_rx_add, payload_len);
           printf("Error: ADV payload length should be 6~37!\n");
         }
+        fflush(stdout);
         continue;
       }
     } else {
       parse_ll_pdu_header_byte(tmp_byte, &ll_pdu_type, &ll_nesn, &ll_sn, &ll_md, &payload_len);
+      fflush(stdout);
     }
     
 
